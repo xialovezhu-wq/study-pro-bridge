@@ -1,0 +1,32 @@
+{
+  "A": {
+    "name": "A｜数学正式入库增强",
+    "url": "https://chatgpt.com/",
+    "created": false,
+    "subjects": [
+      "math"
+    ]
+  },
+  "B": {
+    "name": "B｜数学独立复盘",
+    "url": "https://chatgpt.com/",
+    "created": false,
+    "subjects": [
+      "math"
+    ]
+  },
+  "C": {
+    "name": "C｜数学次日五题",
+    "url": "https://chatgpt.com/",
+    "created": false,
+    "subjects": [
+      "math"
+    ]
+  },
+  "D": {
+    "name": "D｜408次日知识点复盘",
+    "url": "https://chatgpt.com/",
+    "created": false,
+    "subjects": []
+  }
+}

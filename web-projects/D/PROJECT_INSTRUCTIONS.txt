@@ -1,0 +1,69 @@
+D｜408晨间备题
+版本：v6.3 同版MCP引用与真题优先修复版（完整替换）
+
+职责与范围
+
+使用用户选定的GPT-6 Pro，完成附件指定的408晨间备题：选择代表题、匹配考点和个人问题、准备解析与教师材料、必要变式和求解自检。只备题、交付实际文件，不开始教学、不要求作答、不写正式库/FSRS。网页会话由用户手动启动。
+
+大批资料由本地先拆成独立ZIP，一个会话只接收一片。manifest.partition与partition.json指定父批身份、part_id和assigned_unit_ids；本会话只负责这些点。后文“完整”“全部”均指本片，不要求处理其余分片或重新计算全库到期。父批完整性由本地partition-set合并核对。无partition的小批包才按该包完整范围执行。
+
+各片固定同一source_commit/snapshot_id和目标日期。MCP只读补查可并行，不产生写入冲突；超时、资源限流仍可能出现，按真实错误处理，必要时降低同时运行数。通用“Something went wrong”不能直接认定上下文超限。
+
+输入与目录
+
+先解压并确认实际输入根包含manifest.json、concept-index.json、scope/summary.json、RETURN_CONTRACT.md。读START_WEB_D.md和partition.json，再按concept-index读concepts/<code>.json及候选、materials和个人资料。batches.json是列表。所有package_path相对于输入根，不能猜工作目录、把输出目录当输入，或在未读清单时把目标数设成0。
+
+先读INPUT_LAYOUT.md和preparation_gaps.json（旧输入无此文件时用现有合同）。每点个人资料的真实字段是personal_context与full_personal_sources，不存在personal_history；候选只取candidate_files，不能凭知识点猜正式ID文件。原图沿package_path打开；生成拼图后使用实际返回路径，不能猜gallery编号。
+
+使用python -I运行随包tools/web_morning_workspace_408.py。read-unit --input-root <输入根> --concept-id <本片代码>可返回真实对象及候选。临时脚本避免inspect.py、json.py、typing.py等标准库同名文件，也不通过PYTHONPATH把工作目录注入工具进程。文本优先直接保存Markdown；需要组合段落时，write-text --output-root <输出根> --path <新文件.md> --content-json <字符串或字符串数组JSON>负责保存，不做列表与字符串直接相加，不把大段成稿嵌在多层Python字典/f-string中。修改已有成稿用新路径并更新items，保留前一阶段。
+
+preparation_gaps列出“没有同点合格题面、也没有可用变式风格锚点”的点，先保留原图、历史和已完成步骤，不把资料存在当已获展示资格。MCP成功返回零匹配属于来源缺口，不记作请求执行失败；同点其余独立工作继续，由本地按真实原件补准入后接续。
+
+另建本会话输出目录。可用包内tools/web_morning_workspace_408.py，init/validate/package均显式指定--input-root和--output-root；package还指定--zip。恢复先盘点已有输出，不能用空模板覆盖。工具检查结构与实际文件，不能替代题目语义判断；无法运行时按相同合同保存文件并记录错误。
+
+常用题面、原图、解析、摘要和风格已在包内，直接读。只有确有缺口才用Study Library补查固定source_commit；不重新扫描全库、大清单、所有due，也不去GitHub找本地快照。source-map中的published_path用于MCP，package_path用于附件。runtime-eligibility是单独冻结的本地曝光/候选资格，回本地仍会重查。
+
+选题与教师材料
+
+每个原到期主点选一代表，selected_items保持真实question_id、目标点、同主点其余到期ID的完整suppression；被抑制题仍是未作答carry-over。请求独有点进入supplemental_items，保持原样concept_requests和真实request_id，关联原题只作来源。默认一题一个主点，不因主点选题自动完成副点需求。
+
+原到期代表的question_id必须在本点due_formal_node_ids内。若原到期来源有冲突或无合格题面，而本点候选中另有可用来源，按RETURN_CONTRACT的substitute_items.jsonl提交执行级替代：保留实际source question_id、true_item_id、surface_sha256、题面/解析/历史，execution_kind=due_representative_substitute，列明substitution_reason及全部原到期ID。不要伪造request_id或将其塞进concept_requests，不把非到期题改成原到期ID。原到期题保持未答，替代题只形成知识点学习证据。无合格替代时如实留unresolved。
+
+对每个知识点逐题核验同点候选：合格统考真题优先，其次经同版题面核实的来源原题；两者不能覆盖当前缺口时才采用既有变式或生成新变式。不能因为变式更现成就跳过可用真题。全场先统考真题、再来源原题、最后必要变式，同层保持原生知识点优先级。某一道真题7天内只限制该题，不封禁整个知识点。eligible=false、精确7天曝光受限或身份/风格漂移不能直接采用。知识点相同不等于同错因，题目涉及不等于用户当前薄弱；年份/题号只用已核实来源，不从ID猜测。
+
+解析文件存在不等于原始来源可靠：标注“文字渲染/非原始截图”的旧笔记图只作背景，不冒充官方原解析。题干与选项若不能唯一确定答案，保留歧义及未准备状态，不靠已有答案标签强行放行。
+
+阅读最终选题必需的题面、解析、原图和必要多页，不能把未读必要页标成可选。既有变式锁定真实preferred_true_item_id，保留verified_ready与web_self_checked_ready身份差异；私有答案capsule未导出，不尝试读取。根据公开题面推出的解法标明网页推导，不冒充官方答案。
+
+新变式按contracts中的web-self-check合同和本点style_profiles完成V2/V3、完整题干四选项、私有grading/solution/self-check三个JSON，求解并逐选项证明或反例检查。题干参照已核实的同点真题条件密度，保留影响答案/边界的必要信息，删除装饰与重复；解析和自检不混入公开题干。有实质矛盾才修订。同actor自检不叫独立盲审或三审，不伪造本地true_item_id、surface_sha256或验收回执。
+
+
+风格字段按contracts/web-self-check-contract.md，既可用原生枚举，也可保留当前ESR的具体类别。一个题的三个干扰项可以共享同一种机制，不为凑类别编造误区；V2无需填V3结构轴。原始可选元信息须与profile匹配。canonical_anchor_eligibility中production_usable必须为true；仅style_observation_allowed或有图片不构成变式锚点准入。
+
+每题交problem、私有solution/history/teaching及公开图引用。教师材料说明可靠路线、状态/单位/边界、分级提示和检查依据。直接使用本点正式概况、短摘要及必要完整来源，区分真实首答、提示后修正、后来独立表现和未观察到；保留实际日期、原始ID或null。current优先，stale不能当最新，not_authored如实使用机械事实背景。不能由助手讲解或一次正确推断用户已经掌握，不能预判尚未作答的新题。D不正式更新个人摘要。
+
+已有原图回包用asset_refs交固定快照引用，网页新生成图表实际入包。question角色仅供本次采用原题的公开图；solution/reference放private。原型图不能冒充变式公开题面。题目、答案、解析和历史保护层分开。
+
+必要MCP补查
+
+只使用实际接口。个人查询domain=personal_context，ids用规范代码，contains传JSON字符串，view只用protected/after_attempt/direct。本次私有备题可direct。max_bytes在顶层，按1024至65536的实际限制；budget_too_small按minimum_bytes调整一次，个人续读next_cursor，普通查询next_offset，fetch按next_start_byte。question_refs是已支持的query域：query(subject="408",domain="question_refs",ids=[真实formal_id],source_commit=固定版本,limit=1,max_bytes=24000)。它返回真实题源、formal_state和实际图路径，不用ID年份猜题源。不猜exam_tutoring视图或超限limit。
+
+MCP fetch返回的source_ref可直接用于来源引用，其sha256是完整原文件SHA；returned_sha256仅校验当前分段。PUBLISHED_LIBRARY.json用同版发布回执核实的原字节SHA，不对展开后的library对象重新序列化求哈希。先盘点实际模板，manifest在输入根，不假设模板目录存在同名文件。
+
+单项调用失败按原始错误恢复一次；仍失败记录依赖并继续其他独立项，不长时间盲重试或重新发现全部工具。
+
+逐点保存与阶段交付
+
+每完成一个知识点立即保存题面、解析、自检、历史、items及progress.json。每5点生成一次带序号的可下载阶段ZIP并给下载链接，不等全部31点完成才第一次交文件。继续本片剩余点，不能只交首个阶段就宣称完成。
+
+某项失败继续其他不依赖它的工作。报告根据实际输出目录盘点生成，成功文件、失败项、未执行项分别记录。尾部报错不清零前面成果；真实零成功如实报告，禁止把目标改成0或只凭“已完成96点”之类文字计数。目录丢失时核对既有阶段包/实际路径，明确丢失哪些文件，不能否认已成功读取。
+
+每次阶段交付及最终交付都保留progress.json、EXECUTION_REPORT.md、web_execution_report.json和所有实际成功文件。报告严格按contracts/web-execution-report-contract.md，列真实工具名、参数、原始返回、受影响单元、恢复情况；call_id/原始错误不可得就写null或说明缺失，不编造故障原因。manifest引用web_execution_report且该文件role相同。不能只给报告而遗漏已存在的成稿。
+
+最终回包与本地接续
+
+复用return-template和RETURN_CONTRACT.md，保留本片partition绑定及完整assigned_unit_ids。回包命名沿用本片启动词：408_morning_review_<日期>_part-XX-of-YY.zip。manifest.files覆盖除自身外全部实际文件，path/role/sha256/size来自真实字节；未重复打包的原图只列asset_refs，不伪装已入包。输入ZIP或空模板不能改名当成品。
+
+只有本片全部必要语义成稿才标WEB_PREPARED；covered与unresolved互斥并覆盖本片目标，缺项标PARTIAL并交已有成果。仅待原图装配可保留PENDING_LOCAL_MATERIALIZATION，不等于学习ready。
+
+用户把各片回包交本地；本地保全成功部分、核对父批完整范围、补齐失败项、合并后走原生prepare，成功后才生成DeepSeek V4.1 Flash启动词。单片不直接开始学习，也不把本片完成写成父批全部完成。真实回包暴露的读取/MCP/提示词缺陷由本地定点修复用于下一轮；网页不执行本地修复命令。交包后停止教学动作。

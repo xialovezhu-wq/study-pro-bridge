@@ -1,0 +1,23 @@
+# D 408到期知识点输出
+
+版本：D-output-v2（2026-09-13，原图引用交付）。此文件规定备题输出，不是网页学习入口。历史、原图和正式状态通过Study Library MCP从同一就绪本地快照读取，不以GitHub上传为前提。网页完整备题并交包后停止，由用户手动交给本地预处理、生成DeepSeek启动提示词。
+
+每个输出ZIP根目录必须有manifest.json，其字段为：schema_version=1，project（本项目字母），subject（math/english/408中的本科），run_id，source_commit，files。C/D必须有target_date；A必须有input_packages，每项为package_id、version、zip_sha256。files覆盖ZIP中除manifest.json自身以外的每个文件，逐项记录path、sha256、size、role。路径使用安全相对路径；不得含绝对路径、..、符号链接或另一科资料。sha256必须来自实际字节或已验证发布清单，不能拿Git blob SHA-1代替。
+
+source_commit为固定的40位本地快照Git提交SHA，所有引用来自同一快照；它不是GitHub上传证明。source_refs/evidence_refs的每项包含path、sha256、quote；图片不能靠一段文字声称已读，需保留实际原图路径/哈希及任务中的读取依据。缺资料明确列出，不能猜补；文件和引用正确不等于网页模型实际使用已经获得本地验证。
+
+生成、下载、资产装配或导入不会写用户完成/掌握。本地核验来源、完整覆盖、身份、曝光和文件字节，网页自检不冒充独立审核。新学习每题终态Capture，只写事实/曝光/进度；正式判分、FSRS和个人摘要等网页加强包返回后更新。真实更新后的快照失败只恢复同步，不重发学习事件。
+
+输出408_morning_review.zip，包含START_HERE.md、due_concepts.json、selected_items.jsonl、supplemental_items.jsonl、web_variants.jsonl、asset_refs.jsonl、unresolved.jsonl、coverage_report.json、rationale.md、各题真实公开problem以及private中的solution/history_summary/teaching和变式评分/求解/自检材料。网页生成的新图表仍须随包。
+
+已有本地原图按support/d408/asset-delivery-contract.md交引用，不要求网页保存原图文件。manifest声明asset_delivery=snapshot_refs_v1，files只列真实入包文件，不把待装配原图伪装为已入包。asset_refs每行绑定question_id、source_path、source_sha256（未知可null）、package_path、role和visual_status。原题公开图只用question角色且列入image_paths；解析/原型参考只在private。必要阅读未完成仍是缺项，仅无网页图片副本而已读且引用可核实则是PENDING_LOCAL_MATERIALIZATION。全部语义备题完成可标WEB_PREPARED，本地全链准备成功才可生成学习启动提示词。
+
+manifest另须有due_version，它来自本地为本次目标日期提供的只读到期版本，不是本地预选历史包；未提供时明确缺失，不自己编造。due_concepts.json为concept_ids数组对象。
+
+selected_items.jsonl每行包含question_id、review_target_concept_ids、suppressed_same_concept_question_ids、source_label、problem_path、solution_path、image_paths、history_path、source_refs。默认每题负责一个主知识点；多点覆盖须有明确关系证据。同知识点其他到期题写入抑制映射，不能从全到期清单悄悄丢弃。
+
+coverage_report.json的covered_concept_ids与unresolved_concept_ids互斥，并集等于完整review_concept_ids（原到期主点与新请求点的并集）；原样concept_requests必须保留。原生segments不能作为只备第一段的理由。必要覆盖未完成不能标WEB_PREPARED；保留carry-over、原调度/曝光及来源标签。
+
+本地会独立重算完整到期集合并核验去重后导入原晨间入口。选项正确与推理正确分开，已知错误推理不能被正确字母覆盖；提示依赖如实记。真实作答之后才正式回流，不把下载/导入视为掌握。
+
+展示去重不等于学习完成：suppressed题保留在完整到期分母与carry-over，不能因代表题答对而批量写成已复盘或掌握。分别报告概念覆盖与未答节点，只有真实作答的对应节点进入正式回流。
