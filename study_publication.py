@@ -22,16 +22,27 @@ import tempfile
 from typing import Any
 
 import study_web_read
+from study_paths import subject_root
 
 BASE = Path(__file__).resolve().parent
 PDF_RUNTIME = Path.home() / ".cache/codex-runtimes/codex-primary-runtime/dependencies/python/bin/python3"
 SUBJECTS = {s: {"root": Path.home() / "Documents" / f"kaoyan-{s}",
-                "remote": f"YOUR_PRIVATE_GITHUB_OWNER/kaoyan-{s}"}
+                "remote": f"xialovezhu-wq/kaoyan-{s}"}
             for s in ("math", "english", "408")}
+SUBJECTS["math"]["root"] = subject_root("math")
+SUBJECTS["english"]["root"] = subject_root("english")
+SUBJECTS["408"]["root"] = subject_root("408")
 LIMIT = 100 * 1024 * 1024
 CHUNK = 1024 * 1024
-ROOT_MANIFEST_LIMIT = 750 * 1024
+# 2026-09-27: the 408 root reached 755 KB (question_refs ~1 KB per formal node, history_index
+# ~185 KB); 12 new nodes crossed the old 750 KiB guard. Readers parse the root locally and the
+# web pages question_refs through MCP, so a larger guard only bounds runaway growth. Sharding
+# question_refs like original_mappings is the structural follow-up.
+ROOT_MANIFEST_LIMIT = 2 * 1024 * 1024
 INVENTORY_LIMIT = 512 * 1024
+INVENTORY_FIELDS = (("file_inventory", "files"),
+                    ("original_mapping_inventory", "original_mappings"),
+                    ("exclusion_inventory", "exclusions"))
 DENIED_PARTS = {".git", "__pycache__", "node_modules", ".venv", "privatebackups",
                 ".DS_Store", ".ssh", ".aws", ".obsidian", "Computer History", "backups"}
 DENIED_NAMES = {"AGENTS.md", "config.toml", "credentials", "credentials.json",
@@ -76,7 +87,7 @@ def read_json(path: Path, default: Any = None) -> Any:
 
 
 def configured_target(state_dir: Path) -> str:
-    """A single local policy controls all three postcommit publication hooks."""
+    """Publication target for explicit publisher operations."""
     target = read_json(Path(state_dir) / "config.json", {}).get("target", "local")
     if target not in {"local", "github"}:
         raise PublicationError("INVALID_PUBLICATION_TARGET")
@@ -101,7 +112,7 @@ def committed_library(checkout: Path, commit: str) -> tuple[bytes, dict[str, Any
     """Read one immutable local Git version without consulting any remote."""
     raw = run(["git", "-C", str(checkout), "show", f"{commit}:PUBLISHED_LIBRARY.json"]).stdout
     manifest = json.loads(raw)
-    for key, output in (("file_inventory", "files"), ("original_mapping_inventory", "original_mappings")):
+    for key, output in INVENTORY_FIELDS:
         if manifest.get(key):
             records = []
             for shard in manifest[key]:
@@ -119,9 +130,11 @@ def committed_library(checkout: Path, commit: str) -> tuple[bytes, dict[str, Any
 
 def load_library(checkout: Path, manifest: dict[str, Any] | None = None) -> dict[str, Any]:
     manifest = dict(manifest or read_json(checkout / "PUBLISHED_LIBRARY.json", {}))
-    if manifest.get("file_inventory"):
-        files = []
-        for shard in manifest["file_inventory"]:
+    for key, output in INVENTORY_FIELDS:
+        if not manifest.get(key):
+            continue
+        records = []
+        for shard in manifest[key]:
             path = checkout / path_check(shard["path"])
             if file_hash(path) != shard["sha256"]:
                 raise PublicationError("INVENTORY_HASH_MISMATCH", shard["path"])
@@ -129,26 +142,14 @@ def load_library(checkout: Path, manifest: dict[str, Any] | None = None) -> dict
                 rows = [json.loads(line) for line in source if line.strip()]
             if len(rows) != shard["count"]:
                 raise PublicationError("INVENTORY_COUNT_MISMATCH", shard["path"])
-            files.extend(rows)
-        manifest["files"] = files
-    if manifest.get("original_mapping_inventory"):
-        originals = []
-        for shard in manifest["original_mapping_inventory"]:
-            path = checkout / path_check(shard["path"])
-            if file_hash(path) != shard["sha256"]:
-                raise PublicationError("INVENTORY_HASH_MISMATCH", shard["path"])
-            with path.open() as source:
-                rows = [json.loads(line) for line in source if line.strip()]
-            if len(rows) != shard["count"]:
-                raise PublicationError("INVENTORY_COUNT_MISMATCH", shard["path"])
-            originals.extend(rows)
-        manifest["original_mappings"] = originals
+            records.extend(rows)
+        manifest[output] = records
     return manifest
 
 
 def write_library(checkout: Path, manifest: dict[str, Any]) -> None:
     """Keep the one web entrypoint small; large byte inventories are not duplicated."""
-    manifest = {k: v for k, v in manifest.items() if k not in {"file_inventory", "original_mapping_inventory"}}
+    manifest = {k: v for k, v in manifest.items() if k not in {key for key, _ in INVENTORY_FIELDS}}
     encoded = json.dumps(manifest, ensure_ascii=False, indent=2).encode()
     if len(encoded) <= ROOT_MANIFEST_LIMIT:
         write_json(checkout / "PUBLISHED_LIBRARY.json", manifest)
@@ -188,31 +189,35 @@ def write_library(checkout: Path, manifest: dict[str, Any]) -> None:
     flush()
     root["file_inventory"] = shards
     root["inventory_note"] = "Mechanical byte coverage. Use existing history_index and entrypoints for study evidence."
-    if (len(json.dumps(root, ensure_ascii=False, indent=2).encode()) > ROOT_MANIFEST_LIMIT
-            and isinstance(root.get("original_mappings"), list)):
-        original_shards, buffer, size = [], [], 0
-        def flush_originals() -> None:
+    for field, inventory_key, prefix in (
+            ("original_mappings", "original_mapping_inventory", "original-mappings"),
+            ("exclusions", "exclusion_inventory", "exclusions")):
+        if (len(json.dumps(root, ensure_ascii=False, indent=2).encode()) <= ROOT_MANIFEST_LIMIT
+                or not isinstance(root.get(field), list)):
+            continue
+        metadata_shards, buffer, size = [], [], 0
+        def flush_metadata() -> None:
             nonlocal buffer, size
             if not buffer:
                 return
-            relative = f"published-inventory/original-mappings-{len(original_shards) + 1:03d}.jsonl"
+            relative = f"published-inventory/{prefix}-{len(metadata_shards) + 1:03d}.jsonl"
             path = checkout / relative
             if path.is_symlink() or path.parent.is_symlink():
                 raise PublicationError("REMOTE_SYMLINK_COLLISION", relative)
             content = b"".join(buffer)
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_bytes(content)
-            original_shards.append({"path": relative, "sha256": hashlib.sha256(content).hexdigest(),
+            metadata_shards.append({"path": relative, "sha256": hashlib.sha256(content).hexdigest(),
                                     "count": len(buffer), "bytes": len(content)})
             buffer, size = [], 0
-        for row in root.pop("original_mappings"):
+        for row in root.pop(field):
             line = (json.dumps(row, ensure_ascii=False, separators=(",", ":")) + "\n").encode()
             if size + len(line) > INVENTORY_LIMIT:
-                flush_originals()
+                flush_metadata()
             buffer.append(line)
             size += len(line)
-        flush_originals()
-        root["original_mapping_inventory"] = original_shards
+        flush_metadata()
+        root[inventory_key] = metadata_shards
     if len(json.dumps(root, ensure_ascii=False, indent=2).encode()) > ROOT_MANIFEST_LIMIT:
         raise PublicationError("ROOT_ENTRYPOINT_TOO_LARGE")
     write_json(checkout / "PUBLISHED_LIBRARY.json", root)
@@ -400,15 +405,54 @@ def export_pdf_pages(description_path: Path, cache_root: Path, output_path: Path
     return {"created_pages": created, "total_pages": len(output), "bytes": sum(x["bytes"] for x in output)}
 
 
+def _math_quality_module(repo):
+    scripts = Path(repo) / "数学一回滚复习系统/scripts"
+    if not (scripts / "math_formal_quality.py").is_file():
+        return None
+    sys.path.insert(0, str(scripts))
+    try:
+        import math_formal_quality
+        return math_formal_quality
+    finally:
+        sys.path.remove(str(scripts))
+
+
+@contextlib.contextmanager
+def _formal_quality_window(subject, repo, event):
+    if subject == "math":
+        quality = _math_quality_module(repo)
+        if quality is not None:
+            try:
+                with quality.publication_window(repo, event) as binding:
+                    yield binding
+            except quality.QualityError as exc:
+                raise PublicationError(str(exc)) from exc
+            return
+    scripts = Path(repo) / "scripts"
+    if subject != "408" or not (scripts / "formal_quality_408.py").is_file():
+        yield None
+        return
+    sys.path.insert(0, str(scripts))
+    try:
+        import formal_quality_408 as quality
+        with quality.publication_window(repo, event) as binding:
+            yield binding
+    finally:
+        sys.path.remove(str(scripts))
+
+
 class Publisher:
     def __init__(self, subject: str, repo: Path, state: Path,
-                 remote: str | None = None, test_mode: bool = False):
+                 remote: str | None = None, test_mode: bool = False, *, local_only: bool = True):
         self.subject, self.repo = subject, repo.resolve()
         self.remote = remote or SUBJECTS[subject]["remote"]
-        self.state = state.resolve() / subject
-        self.checkout = self.state / "checkout"
         self.test_mode = test_mode
-        self.target = configured_target(state)
+        self.target = "local" if local_only else configured_target(state)
+        self.subject_state = state.resolve() / subject
+        # A backup has its own Git ancestry, worktree, receipt history, hash/LFS
+        # caches and latest pointer. It never resets the learning snapshot branch.
+        self.state = self.subject_state if self.target == "local" else self.subject_state / "github-backup"
+        self.checkout = self.state / "checkout"
 
     def remote_metadata(self) -> dict[str, Any]:
         if self.target == "local":
@@ -457,26 +501,66 @@ class Publisher:
         return value
 
     def receipt_path(self, event: str) -> Path:
-        return self.state / "receipts" / (hashlib.sha256(event.encode()).hexdigest() + ".json")
+        path = self.state / "receipts" / (hashlib.sha256(event.encode()).hexdigest() + ".json")
+        if self.target == "local":
+            # A local postcommit can finish under its original event ID while a
+            # historical external operation keeps its own exact retry receipt.
+            local_path = path.with_suffix(".local.json")
+            if local_path.is_file():
+                return local_path
+            prior = read_json(path)
+            if prior and prior.get("publication_target", "github") != "local" and prior.get("status") != "PUBLISHED":
+                return local_path
+        return path
 
     def verified_lfs_cache(self, entries: list[dict[str, Any]]) -> dict[str, Any]:
         """Only earlier successful remote readbacks authorize a zero-transfer reuse."""
-        latest = read_json(self.state / "latest.json", {})
-        known = latest.get("lfs_verified_objects", {}) if latest.get("status") == "PUBLISHED" else {}
         verified = {}
-        for entry in entries:
-            sha = entry["sha256"]
-            record = known.get(sha, {})
-            path = self.state / "lfs-readback/objects" / sha[:2] / sha[2:4] / sha
-            if (record.get("bytes") == entry["bytes"] and record.get("remote_verified_at")
-                    and path.is_file() and record.get("stamp") == stamp(path)):
+        roots = [self.state]
+        if self.target == "github":
+            roots.append(self.subject_state)  # Reuse a proven pre-isolation readback only.
+        for root in roots:
+            latest = read_json(root / "latest.json", {})
+            if latest.get("status") != "PUBLISHED" or latest.get("publication_target", "github") != "github":
+                continue
+            known = latest.get("lfs_verified_objects", {})
+            for entry in entries:
+                sha = entry["sha256"]
+                if sha in verified:
+                    continue
+                record = known.get(sha, {})
+                relative = Path("lfs-readback/objects") / sha[:2] / sha[2:4] / sha
+                path = root / relative
+                if (record.get("bytes") != entry["bytes"] or not record.get("remote_verified_at")
+                        or not path.is_file() or record.get("stamp") != stamp(path)):
+                    continue
+                if root != self.state:
+                    destination = self.state / relative
+                    destination.parent.mkdir(parents=True, exist_ok=True)
+                    if not destination.is_file():
+                        shutil.copyfile(path, destination)
+                    if file_hash(destination) != sha:
+                        raise PublicationError("LFS_REMOTE_BYTES_UNVERIFIED", str(relative))
+                    record = dict(record, stamp=stamp(destination))
                 verified[sha] = record
         return verified
 
     def prepare(self, event: str, desc: dict[str, Any], lfs_verified: bool = False,
                 extra_web_binary_paths: set[str] | None = None) -> dict[str, Any]:
         """Stage a read-only source snapshot; no network mutation or git commit."""
-        base = git(self.checkout, "rev-parse", "HEAD" if self.target == "local" else "origin/main")
+        if self.target == "local":
+            # Recover even if an older manual operation left HEAD on a
+            # divergent branch while the last acknowledged snapshot stayed put.
+            latest = read_json(self.state / "latest.json", {})
+            anchor = latest.get("source_commit") if latest.get("status") == "PUBLISHED" else None
+            if anchor and not re.fullmatch(r"[0-9a-f]{40}", anchor):
+                raise PublicationError("INVALID_LOCAL_SNAPSHOT_ANCHOR")
+            base = git(self.checkout, "rev-parse", "HEAD")
+            if anchor and run(["git", "-C", str(self.checkout), "merge-base", "--is-ancestor",
+                               anchor, base], check=False).returncode:
+                base = git(self.checkout, "rev-parse", "--verify", f"{anchor}^{{commit}}")
+        else:
+            base = git(self.checkout, "rev-parse", "origin/main")
         # A previously interrupted owned snapshot is retained for diagnosis; reset
         # only tracked paths in this publisher-owned disposable checkout.
         git(self.checkout, "reset", "--hard", base)
@@ -704,8 +788,7 @@ class Publisher:
         elif self.remote_head() != receipt["base_commit"]:
             raise PublicationError("REMOTE_ADVANCED_REPREPARE_REQUIRED")
         explicit = [x["path"] for x in manifest["files"]] + ["PUBLISHED_LIBRARY.json"]
-        explicit.extend(x["path"] for x in manifest.get("file_inventory", []))
-        explicit.extend(x["path"] for x in manifest.get("original_mapping_inventory", []))
+        explicit.extend(x["path"] for key, _ in INVENTORY_FIELDS for x in manifest.get(key, []))
         web_files = []
         if receipt.get("web_transport"):
             reference = receipt["web_transport"]
@@ -796,6 +879,17 @@ class Publisher:
         raw, manifest = committed_library(self.checkout, candidate)
         if hashlib.sha256(raw).hexdigest() != receipt["manifest_sha256"]:
             raise PublicationError("LOCAL_SNAPSHOT_MANIFEST_CHANGED")
+        if self.subject == "math" and (quality := _math_quality_module(self.repo)):
+            if quality.active(self.repo) or receipt.get("formal_quality_generation_sha256"):
+                try:
+                    personal = json.loads(git(self.checkout, "show", f"{candidate}:personalization/math/manifest.json"))
+                    binding = quality.binding_is_expected(self.repo, event, personal)
+                    if (not binding or binding["generation_sha256"] != receipt.get("formal_quality_generation_sha256")
+                            or any(personal[k] != manifest["personalization"][k]
+                                   for k in ("version", "formal_version"))):
+                        raise PublicationError("MATH_FORMAL_QUALITY_COMMIT_MISMATCH")
+                except (quality.QualityError, KeyError) as exc:
+                    raise PublicationError("MATH_FORMAL_QUALITY_COMMIT_MISMATCH", str(exc)) from exc
         actual = {}
         for row in git(self.checkout, "ls-tree", "-r", "-z", candidate).split("\0"):
             if row:
@@ -857,8 +951,8 @@ class Publisher:
                 observed = self.remote_head()
                 if observed != candidate:
                     raise PublicationError("REMOTE_VERIFICATION_FAILED")
-        receipt.update(status="PUBLISHED", source_commit=candidate,
-                       remote_head_observed=observed, remote_ref_verified_at=now(),
+        receipt.update(status="PUBLISHED", source_commit=candidate, publication_target="github",
+                       github_backup_performed=True, remote_head_observed=observed, remote_ref_verified_at=now(),
                        web_read_status="NOT_YET_VERIFIED")
         if entries:
             # A separate empty-first cache proves actual remote object download;
@@ -898,16 +992,115 @@ class Publisher:
             write_json(self.state / "latest.json", public_receipt(receipt))
         return receipt
 
+    def _legacy_backup(self, event: str, prepared_hash: str | None) -> dict[str, Any] | None:
+        """Reconcile an explicitly requested historical backup, leaving its original evidence in place."""
+        legacy = self.subject_state / "receipts" / self.receipt_path(event).name
+        row = read_json(legacy)
+        if not row or row.get("publication_target", "github") != "github":
+            return None
+        if (row.get("event_id") != event or row.get("subject") != self.subject
+                or row.get("repository") != self.remote or row.get("branch") != "main"):
+            raise PublicationError("HISTORICAL_BACKUP_IDENTITY_MISMATCH")
+        # Uncommitted, unapproved requests can be prepared independently.
+        candidate = row.get("candidate_commit") or row.get("source_commit")
+        if not candidate and prepared_hash is None:
+            return None
+        with locked(self.subject_state / "publication.lock"):
+            row_raw = legacy.read_bytes()
+            if json.loads(row_raw) != row:
+                raise PublicationError("HISTORICAL_BACKUP_RECEIPT_CHANGED")
+            old_checkout = self.subject_state / "checkout"
+            recovered = dict(row, publication_target="github", legacy_receipt_path=str(legacy),
+                             legacy_receipt_sha256=hashlib.sha256(row_raw).hexdigest())
+
+            def copy_verified(relative, expected, old_root, new_root, *, lfs_bytes=None):
+                name = path_check(relative)
+                old, new = old_root / name, new_root / name
+                if not old.is_file() or old.is_symlink() or not old.resolve().is_relative_to(old_root.resolve()):
+                    raise PublicationError("HISTORICAL_BACKUP_SOURCE_UNAVAILABLE", name)
+                if new.is_symlink() or not new.resolve().is_relative_to(new_root.resolve()):
+                    raise PublicationError("HISTORICAL_BACKUP_DESTINATION_UNSAFE", name)
+                if file_hash(old) != expected:
+                    if lfs_bytes is None:
+                        raise PublicationError("HISTORICAL_BACKUP_SOURCE_CHANGED", name)
+                    old = local_lfs_object(self.subject_state, expected, lfs_bytes)
+                new.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(old, new)
+                if file_hash(new) != expected:
+                    raise PublicationError("HISTORICAL_BACKUP_COPY_MISMATCH", name)
+
+            web = row.get("web_transport")
+            if web:
+                if not web["path"].startswith("web-read-manifests/"):
+                    raise PublicationError("INVALID_WEB_TRANSPORT_CACHE")
+                copy_verified(web["path"], web["sha256"], self.subject_state, self.state)
+            if candidate:
+                if not re.fullmatch(r"[0-9a-f]{40}", candidate):
+                    raise PublicationError("INVALID_HISTORICAL_BACKUP_COMMIT")
+                if run(["git", "-C", str(self.checkout), "cat-file", "-e", candidate], check=False).returncode:
+                    # Fetch the already committed bytes from our prior LOCAL store.
+                    git(self.checkout, "fetch", "--no-tags", str(old_checkout), candidate)
+                committed, _ = committed_library(self.checkout, candidate)
+                if hashlib.sha256(committed).hexdigest() != row["manifest_sha256"]:
+                    raise PublicationError("HISTORICAL_BACKUP_MANIFEST_CHANGED")
+                recovered["candidate_commit"] = candidate
+                remote_contains = run(["git", "-C", str(self.checkout), "merge-base", "--is-ancestor",
+                                       candidate, "origin/main"], check=False).returncode == 0
+                if row.get("status") == "PUBLISHED":
+                    if not remote_contains:
+                        raise PublicationError("HISTORICAL_BACKUP_NO_LONGER_ON_REMOTE")
+                    return recovered
+                # A candidate already present remotely only needs the normal
+                # budget-authorized download/readback. Upload bytes are needed
+                # solely to finish a candidate that still has to be pushed.
+                for asset in ([] if remote_contains else row.get("lfs", [])):
+                    sha = asset["sha256"]
+                    old = local_lfs_object(self.subject_state, sha, asset["bytes"])
+                    new = self.checkout / ".git/lfs/objects" / sha[:2] / sha[2:4] / sha
+                    new.parent.mkdir(parents=True, exist_ok=True)
+                    if not new.exists():
+                        shutil.copyfile(old, new)
+                    local_lfs_object(self.state, sha, asset["bytes"])
+            else:
+                if row.get("status") != "PREPARED" or row.get("manifest_sha256") != prepared_hash:
+                    raise PublicationError("PREPARED_MANIFEST_BINDING_MISMATCH")
+                base = row.get("base_commit")
+                if not isinstance(base, str) or not re.fullmatch(r"[0-9a-f]{40}", base):
+                    raise PublicationError("INVALID_HISTORICAL_BACKUP_COMMIT")
+                git(self.checkout, "reset", "--hard", base)
+                copy_verified("PUBLISHED_LIBRARY.json", prepared_hash, old_checkout, self.checkout)
+                manifest = read_json(self.checkout / "PUBLISHED_LIBRARY.json")
+                for shard in (row for key, _ in INVENTORY_FIELDS for row in manifest.get(key, [])):
+                    copy_verified(shard["path"], shard["sha256"], old_checkout, self.checkout)
+                files = load_library(self.checkout, manifest)["files"]
+                if web:
+                    files = files + read_json(self.state / web["path"])["generated_files"]
+                for entry in files:
+                    copy_verified(entry["path"], entry["sha256"], old_checkout, self.checkout,
+                                  lfs_bytes=entry["bytes"] if entry.get("storage") == "git-lfs" else None)
+                if row.get("source_cache"):
+                    ref = row["source_cache"]
+                    if ref["path"] != "hash-cache.json":
+                        raise PublicationError("SOURCE_SNAPSHOT_CHANGED")
+                    copy_verified(ref["path"], ref["sha256"], self.subject_state, self.state)
+            write_json(self.receipt_path(event), recovered)
+            return recovered
+
     def execute(self, event: str, description: dict[str, Any] | None = None,
                 prepare_only: bool = False, lfs_verified: bool = False,
                 prepared_manifest_sha256: str | None = None,
                 wait_for_lock: bool = False, extra_web_binary_paths: set[str] | None = None) -> dict[str, Any]:
         if not event.strip() or len(event) > 200 or any(ord(c) < 32 for c in event):
             raise PublicationError("INVALID_EVENT_ID")
-        with locked(self.state / "publication.lock", blocking=wait_for_lock):
+        with locked(self.state / "publication.lock", blocking=wait_for_lock), \
+                _formal_quality_window(self.subject, self.repo, event) as formal_quality:
             metadata = self.remote_metadata()
             self.initialize()
             prior = read_json(self.receipt_path(event))
+            if prior is None and self.target == "github":
+                prior = self._legacy_backup(event, prepared_manifest_sha256)
+                if prior and prior.get("status") == "PUBLISHED":
+                    return public_receipt(prior)
             if prior and prior.get("status") == "PUBLISHED":
                 # Idempotency belongs to this formal event, not to today's files.
                 return public_receipt(self.resume_push(prior, lfs_verified=lfs_verified))
@@ -951,6 +1144,18 @@ class Publisher:
                 desc["sources"].extend(pages)
                 desc = normalize(desc, self.subject)
             prepared = self.prepare(event, desc, lfs_verified, extra_web_binary_paths)
+            if formal_quality and self.subject == "math":
+                personal = read_json(self.checkout / "personalization/math/manifest.json", {})
+                if personal.get("formal_quality") != formal_quality:
+                    raise PublicationError("MATH_FORMAL_QUALITY_PREPARED_MISMATCH")
+                prepared["formal_quality_generation_sha256"] = formal_quality["generation_sha256"]
+            elif formal_quality:
+                generation = read_json(self.repo / formal_quality["generation_ref"])
+                personal = read_json(self.checkout / "personalization/408/manifest.json", {})
+                if (personal.get("source_version") != generation["source_version"]
+                        or personal.get("version") != generation["personal_version"]):
+                    raise PublicationError("FORMAL_QUALITY_PERSONAL_VERSION_MISMATCH")
+                prepared["formal_quality_generation_sha256"] = Path(formal_quality["generation_ref"]).stem
             prepared["local_snapshot_metadata" if self.target == "local" else "remote_metadata"] = metadata
             write_json(self.receipt_path(event), prepared)
             if prepare_only:
@@ -981,7 +1186,7 @@ def mark_pending(subject: str, event_id: str, state_dir: Path = BASE / "publicat
     """Zero-network postcommit marker using the publication's one event receipt."""
     if subject not in SUBJECTS or not event_id.strip() or len(event_id) > 200:
         raise PublicationError("INVALID_EVENT_ID")
-    publisher = Publisher(subject, SUBJECTS[subject]["root"], state_dir)
+    publisher = Publisher(subject, SUBJECTS[subject]["root"], state_dir, local_only=True)
     with locked(publisher.state / "request.lock", blocking=True):
         path = publisher.receipt_path(event_id)
         prior = read_json(path)
@@ -995,21 +1200,30 @@ def mark_pending(subject: str, event_id: str, state_dir: Path = BASE / "publicat
 
 
 def verify_published(subject: str, source_commit: str,
-                     state_dir: Path = BASE / "publication") -> dict[str, Any]:
+                     state_dir: Path = BASE / "publication", *, verify_remote: bool = False) -> dict[str, Any]:
     if not re.fullmatch(r"[0-9a-f]{40}", source_commit):
         raise PublicationError("INVALID_SOURCE_COMMIT")
-    publisher = Publisher(subject, SUBJECTS[subject]["root"], state_dir)
+    if verify_remote and configured_target(state_dir) != "github":
+        raise PublicationError("GITHUB_BACKUP_NOT_CONFIGURED")
+    publisher = Publisher(subject, SUBJECTS[subject]["root"], state_dir, local_only=not verify_remote)
+    roots = [publisher.state]
+    if verify_remote:
+        roots.append(publisher.subject_state)  # Pre-isolation, already published GitHub history.
     receipts = []
-    for path in (publisher.state / "receipts").glob("*.json"):
-        row = read_json(path)
-        if (row.get("subject") == subject and row.get("status") == "PUBLISHED"
-                and row.get("source_commit") == source_commit
-                and row.get("repository") == publisher.remote and row.get("branch") == "main"):
-            receipts.append((path, row))
+    for root in roots:
+        for path in sorted((root / "receipts").glob("*.json")):
+            row = read_json(path)
+            if (row.get("subject") == subject and row.get("status") == "PUBLISHED"
+                    and row.get("source_commit") == source_commit
+                    and row.get("repository") == publisher.remote and row.get("branch") == "main"
+                    and (not verify_remote or row.get("publication_target", "github") == "github")):
+                receipts.append((path, row))
+        if receipts:
+            break
     if not receipts:
         raise PublicationError("NO_CANONICAL_PUBLICATION_RECEIPT")
     with locked(publisher.state / "publication.lock"):
-        offline = publisher.target == "local" or receipts[0][1].get("publication_target") == "local"
+        offline = not verify_remote
         if offline:
             if not (publisher.checkout / ".git").exists():
                 raise PublicationError("LOCAL_SNAPSHOT_STORE_UNAVAILABLE")
@@ -1034,9 +1248,11 @@ def verify_published(subject: str, source_commit: str,
         manifest_path.parent.mkdir(parents=True, exist_ok=True)
         manifest_path.write_bytes(raw_manifest)
         resolved = dict(manifest)
-        if manifest.get("file_inventory"):
-            files = []
-            for shard in manifest["file_inventory"]:
+        for key, output in INVENTORY_FIELDS:
+            if not manifest.get(key):
+                continue
+            records = []
+            for shard in manifest[key]:
                 path_check(shard["path"])
                 raw = run(["git", "-C", str(publisher.checkout), "show", f"{source_commit}:{shard['path']}"]).stdout
                 if hashlib.sha256(raw).hexdigest() != shard["sha256"]:
@@ -1044,29 +1260,17 @@ def verify_published(subject: str, source_commit: str,
                 rows = [json.loads(line) for line in raw.splitlines() if line.strip()]
                 if len(rows) != shard["count"]:
                     raise PublicationError("INVENTORY_COUNT_MISMATCH", shard["path"])
-                files.extend(rows)
-            resolved["files"] = files
-        if manifest.get("original_mapping_inventory"):
-            originals = []
-            for shard in manifest["original_mapping_inventory"]:
-                path_check(shard["path"])
-                raw = run(["git", "-C", str(publisher.checkout), "show", f"{source_commit}:{shard['path']}"]).stdout
-                if hashlib.sha256(raw).hexdigest() != shard["sha256"]:
-                    raise PublicationError("INVENTORY_HASH_MISMATCH", shard["path"])
-                rows = [json.loads(line) for line in raw.splitlines() if line.strip()]
-                if len(rows) != shard["count"]:
-                    raise PublicationError("INVENTORY_COUNT_MISMATCH", shard["path"])
-                originals.extend(rows)
-            resolved["original_mappings"] = originals
+                records.extend(rows)
+            resolved[output] = records
         resolved_path = manifest_path.with_name(f"{source_commit}.resolved.json")
         write_json(resolved_path, resolved)
         verified_transport_paths = 0
         if receipt.get("web_transport"):
             reference = receipt["web_transport"]
             relative = path_check(reference["path"])
-            if not relative.startswith("web-read-manifests/") or file_hash(publisher.state / relative) != reference["sha256"]:
+            if not relative.startswith("web-read-manifests/") or file_hash(path.parent.parent / relative) != reference["sha256"]:
                 raise PublicationError("WEB_TRANSPORT_CACHE_CHANGED")
-            expected = read_json(publisher.state / relative)["generated_files"]
+            expected = read_json(path.parent.parent / relative)["generated_files"]
             actual = {}
             tree = git(publisher.checkout, "ls-tree", "-r", "-z", source_commit)
             for record in tree.split("\0"):
@@ -1099,7 +1303,11 @@ def request_publication(subject: str, event_id: str, repo_root: Path,
         return {"status": "NOT_PRODUCTION_REPO", "subject": subject, "network_started": False}
     if not event_id.strip() or len(event_id) > 200 or any(ord(c) < 32 for c in event_id):
         raise PublicationError("INVALID_EVENT_ID")
-    publisher = Publisher(subject, Path(repo_root), state_dir)
+    if subject == "math" and (quality := _math_quality_module(repo_root)):
+        marker = quality.active(repo_root)
+        if marker and (marker["status"] != "READY_TO_PUBLISH" or marker["publication_event_id"] != event_id):
+            return {"status": quality.HOLD, "subject": subject, "event_id": event_id, "network_started": False}
+    publisher = Publisher(subject, Path(repo_root), state_dir, local_only=True)
     with locked(publisher.state / "request.lock", blocking=True):
         path = publisher.receipt_path(event_id)
         receipt = read_json(path, {"status": "PENDING", "subject": subject, "event_id": event_id,
@@ -1125,8 +1333,15 @@ def request_publication(subject: str, event_id: str, repo_root: Path,
                        "--subject", subject, "--state-dir", str(state_dir), "--lock-fd", str(launch)]
             log = (publisher.state / "worker.log").open("ab")
             try:
+                worker_env = dict(os.environ)
+                if subject == "math":
+                    worker_env["KAOYAN_MATH_PROJECT_ROOT"] = str(Path(repo_root).resolve())
+                elif subject == "english":
+                    worker_env["KAOYAN_ENGLISH_PROJECT_ROOT"] = str(Path(repo_root).resolve())
+                elif subject == "408":
+                    worker_env["KAOYAN_408_PROJECT_ROOT"] = str(Path(repo_root).resolve())
                 child = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=log, stderr=log,
-                                         pass_fds=(launch,), start_new_session=True, cwd=BASE)
+                                         pass_fds=(launch,), start_new_session=True, cwd=BASE, env=worker_env)
             finally:
                 log.close()
             return {"status": "STARTED", "subject": subject, "event_id": event_id,
@@ -1138,10 +1353,12 @@ def request_publication(subject: str, event_id: str, repo_root: Path,
 
 def drain_pending(subject: str, state_dir: Path, launch_fd: int) -> int:
     """One finite postcommit worker. No schedule, polling, model, or error retry."""
-    publisher = Publisher(subject, SUBJECTS[subject]["root"], state_dir)
+    publisher = Publisher(subject, SUBJECTS[subject]["root"], state_dir, local_only=True)
     while True:
         with locked(publisher.state / "request.lock", blocking=True):
             all_receipts = [(path, read_json(path)) for path in (publisher.state / "receipts").glob("*.json")]
+            # Optional remote backups never run or get acknowledged by this local worker.
+            all_receipts = [(path, row) for path, row in all_receipts if row.get("publication_target") == "local"]
             pending = [(path, r) for path, r in all_receipts if r.get("automatic_requested")
                        and r.get("status") != "PUBLISHED"]
             if not pending:
@@ -1192,7 +1409,8 @@ def drain_pending(subject: str, state_dir: Path, launch_fd: int) -> int:
             if not candidates:
                 for path in (publisher.state / "receipts").glob("*.json"):
                     original = read_json(path)
-                    if (original.get("request_origin") == "postcommit"
+                    if (original.get("publication_target") == "local"
+                            and original.get("request_origin") == "postcommit"
                             and original.get("status") != "PUBLISHED"
                             and not original.get("candidate_commit")
                             and (original.get("requested_at") or "~") <= snapshot_cutoff):
@@ -1203,10 +1421,11 @@ def drain_pending(subject: str, state_dir: Path, launch_fd: int) -> int:
 
 def dispatch_pending(subject: str, repo_root: Path, state_dir: Path) -> dict[str, Any] | None:
     """Resume only an already requested event after a direct CLI releases ownership."""
-    publisher = Publisher(subject, repo_root, state_dir)
+    publisher = Publisher(subject, repo_root, state_dir, local_only=True)
     with locked(publisher.state / "request.lock", blocking=True):
         pending = [read_json(path) for path in (publisher.state / "receipts").glob("*.json")]
-        pending = [row for row in pending if row.get("automatic_requested") and row.get("status") != "PUBLISHED"]
+        pending = [row for row in pending if row.get("publication_target") == "local"
+                   and row.get("automatic_requested") and row.get("status") != "PUBLISHED"]
     if not pending:
         return None
     selected = max(pending, key=lambda row: row.get("requested_at", ""))
@@ -1225,22 +1444,94 @@ def valid_lfs_evidence(evidence: Any) -> bool:
                 and dt.timedelta(0) <= age < dt.timedelta(days=1))
 
 
+def _verify_personalization_batches(snap, paths, *, max_bytes=None, max_objects=None):
+    """Cold whole-generation verification with bounded temporary batches.
+
+    Interactive readers keep their per-request limits. This explicit audit
+    verifies every declared byte without asking one request to hold a whole
+    growing generation, and releases only copies created by this audit.
+    """
+    from study_mcp import MAX_PERSONAL_SNAPSHOT_BYTES, MAX_PERSONAL_SNAPSHOT_OBJECTS
+    from bridge_archives import require
+    byte_limit = min(max_bytes or 64 * 1024 * 1024, MAX_PERSONAL_SNAPSHOT_BYTES)
+    count_limit = min(max_objects or 2048, MAX_PERSONAL_SNAPSHOT_OBJECTS)
+    batch, size, count = [], 0, 0
+
+    def verify(batch):
+        newly_cached = [p for p in batch if not (snap.cache / p).is_file()]
+        snap.materialize_paths(batch)
+        for path in batch:
+            snap.path(path)
+        for path in newly_cached:
+            (snap.cache / path).unlink()
+            snap._verified.pop(path, None)
+
+    for path in paths:
+        row = snap.files[path]
+        declared = int(row.get('bytes') or 0)
+        # Original evidence can legitimately be a large LFS textbook. It is
+        # never a JSON object for an interactive personalization request. Use
+        # the existing exact-original reader (streamed copy/hash) for that
+        # role, without changing the JSON batch limits or splitting an object.
+        original_lfs = (row.get('kind') == 'personalization_source_evidence'
+                        and row.get('storage') == 'git-lfs'
+                        and path.startswith(f'personalization/{snap.subject}/sources/'))
+        if declared > MAX_PERSONAL_SNAPSHOT_BYTES and original_lfs:
+            if batch:
+                verify(batch); count += len(batch); batch, size = [], 0
+            newly_cached = not (snap.cache / path).is_file()
+            try:
+                source = snap.path(path)
+                require(source.stat().st_size == declared,
+                        'PERSONAL_SOURCE_SIZE_MISMATCH', path)
+            finally:
+                if newly_cached and (snap.cache / path).is_file():
+                    (snap.cache / path).unlink()
+                    snap._verified.pop(path, None)
+            count += 1
+            continue
+        require(0 <= declared <= MAX_PERSONAL_SNAPSHOT_BYTES,
+                'PERSONAL_SNAPSHOT_SINGLE_OBJECT_TOO_LARGE', path)
+        if batch and (len(batch) >= count_limit or size + declared > byte_limit):
+            verify(batch); count += len(batch); batch, size = [], 0
+        batch.append(path); size += declared
+    if batch:
+        verify(batch); count += len(batch)
+    return count
+
+
 def verify_current(subject: str) -> dict[str, Any]:
     """Verify published data and the installed math calculation bindings."""
     from study_mcp import LibraryStore
     from bridge_archives import BridgeError
-    store = LibraryStore(BASE)
+    # Keep cold verification copies beside the configured publication. Strict
+    # resolution refuses a disconnected archive rather than making a fake root.
+    cache_parent = (BASE / 'publication' / subject).resolve(strict=True)
+    store = LibraryStore(BASE, cache_parent=cache_parent)
     try:
         snap = store.snapshot(subject)
         freshness = store.freshness(snap)
         prefix = 'personalization/' + subject + '/'
         verified = sorted(p for p in snap.files if p.startswith(prefix))
         if subject != 'english' and snap.library.get('entrypoints', {}).get('personalization'):
-            # One bulk fetch, then a verified read of every published personal
-            # file. Reading them one by one would spawn a git process per path.
-            snap.materialize_paths(verified)
-            for path in verified:
-                snap.path(path)
+            _verify_personalization_batches(snap, verified)
+        if subject == 'english' and snap.library.get('personalization', {}).get('entrypoint'):
+            contract = snap.library['personalization']
+            entry = 'context/personal-summary/current.json'
+            if contract['entrypoint'] != entry or file_hash(snap.path(entry)) != contract['projection_sha256']:
+                raise PublicationError("ENGLISH_TEACHING_INDEX_MISMATCH")
+            index = json.loads(snap.text(entry))
+            if (index['version'] != contract['version'] or index['memory_generation'] != contract['memory_generation']
+                    or index['coverage'] != contract['coverage']):
+                raise PublicationError("ENGLISH_SUMMARY_IDENTITY_MISMATCH")
+            verified = [entry]
+            for member in index['members'].values():
+                path = member['path']
+                if not path.startswith('context/personal-summary/') or file_hash(snap.path(path)) != member['sha256']:
+                    raise PublicationError("ENGLISH_TEACHING_MEMBER_MISMATCH")
+                verified.append(path)
+            if set(verified) != {p for p in snap.files if p.startswith('context/personal-summary/')}:
+                raise PublicationError("ENGLISH_TEACHING_CLOSURE_MISMATCH")
         if subject != 'english' and not verified:
             freshness.update(status='missing', reason='personalization_not_published')
         native = {'status': 'not_applicable'}
@@ -1250,11 +1541,26 @@ def verify_current(subject: str) -> dict[str, Any]:
                 native = {'status': 'matched', 'verified_bindings': len(bindings)}
             except BridgeError as exc:
                 native = {'status': 'mismatch', 'error': exc.code, 'detail': exc.detail}
-        ready = freshness['status'] == 'current' and native['status'] != 'mismatch'
+        quality_result = {}
+        if subject == 'math' and (quality := _math_quality_module(SUBJECTS[subject]["root"])):
+            try:
+                personal = json.loads(snap.text("personalization/math/manifest.json"))
+                binding = quality.binding_is_expected(SUBJECTS[subject]["root"], snap.receipt.get("event_id"), personal)
+                if binding:
+                    if (snap.receipt.get("formal_quality_generation_sha256") != binding["generation_sha256"]
+                            or any(personal[k] != snap.library["personalization"][k]
+                                   for k in ("version", "formal_version"))):
+                        raise quality.QualityError("quality_replica_binding_mismatch")
+                    quality_result["formal_quality"] = binding
+            except (OSError, ValueError, KeyError, BridgeError) as exc:
+                quality_result["formal_quality_error"] = getattr(exc, "code", str(exc))
+        ready = (freshness['status'] == 'current' and native['status'] != 'mismatch'
+                 and not quality_result.get("formal_quality_error")
+                 and (subject != 'english' or freshness.get('personal_summary_freshness') == 'current'))
         return {**snap.identity(), 'status': 'PUBLISHED_CURRENT' if ready else 'SYNC_PENDING',
                 'freshness': freshness, 'verified_personalization_files': len(verified),
                 'native_calculation_bindings': native,
-                'publication_event_id': snap.receipt.get('event_id')}
+                'publication_event_id': snap.receipt.get('event_id'), **quality_result}
     finally:
         store.close()
 
@@ -1269,6 +1575,7 @@ def main(argv: list[str] | None = None) -> int:
     publish.add_argument("--state-dir", type=Path, default=BASE / "publication")
     publish.add_argument("--prepare-only", action="store_true")
     publish.add_argument("--prepared-manifest-sha256", help="Publish this already reviewed candidate without re-exporting sources")
+    publish.add_argument("--github-backup", action="store_true", help="Manually use an explicitly configured GitHub backup target")
     publish.add_argument("--web-binary-paths", type=Path,
                          help="Optional UTF-8 list of extra non-LFS original paths requiring bounded transport")
     publish.add_argument("--lfs-budget-evidence", type=Path,
@@ -1280,6 +1587,7 @@ def main(argv: list[str] | None = None) -> int:
     verify = sub.add_parser("verify-published")
     verify.add_argument("--subject", choices=SUBJECTS, required=True)
     verify.add_argument("--source-commit", required=True)
+    verify.add_argument("--verify-remote", action="store_true", help="Check the remote for an explicitly requested historical GitHub publication")
     verify.add_argument("--state-dir", type=Path, default=BASE / "publication")
     current = sub.add_parser('verify-current', help='Read-only final check of current formal/personal versions against the MCP snapshot')
     current.add_argument('--subject', choices=SUBJECTS, required=True)
@@ -1305,7 +1613,7 @@ def main(argv: list[str] | None = None) -> int:
             print(json.dumps(mark_pending(args.subject, args.event_id, args.state_dir), ensure_ascii=False))
             return 0
         if args.command == "verify-published":
-            print(json.dumps(verify_published(args.subject, args.source_commit, args.state_dir), ensure_ascii=False))
+            print(json.dumps(verify_published(args.subject, args.source_commit, args.state_dir, verify_remote=args.verify_remote), ensure_ascii=False))
             return 0
         if args.command == 'verify-current':
             result = verify_current(args.subject)
@@ -1317,23 +1625,29 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "run-pending":
             return drain_pending(args.subject, args.state_dir, args.lock_fd)
         verified = False
-        if args.lfs_budget_evidence and configured_target(args.state_dir) == "github":
+        if args.github_backup and configured_target(args.state_dir) != "github":
+            raise PublicationError("GITHUB_BACKUP_NOT_CONFIGURED")
+        if args.github_backup and args.lfs_budget_evidence:
             evidence = read_json(args.lfs_budget_evidence)
             verified = valid_lfs_evidence(evidence)
             if not verified:
                 raise PublicationError("INVALID_LFS_BUDGET_EVIDENCE")
-        publisher = Publisher(args.subject, args.repo or SUBJECTS[args.subject]["root"], args.state_dir)
+        publisher = Publisher(args.subject, args.repo or SUBJECTS[args.subject]["root"], args.state_dir,
+                              local_only=not args.github_backup)
         with locked(publisher.state / "launch.lock"):
             result = publisher.execute(args.event_id, prepare_only=args.prepare_only, lfs_verified=verified,
                                        prepared_manifest_sha256=args.prepared_manifest_sha256,
                                        extra_web_binary_paths={line.strip() for line in args.web_binary_paths.read_text().splitlines() if line.strip()} if args.web_binary_paths else None)
-        followup = dispatch_pending(args.subject, publisher.repo, args.state_dir)
-        if followup:
-            result["pending_followup"] = followup
+        if not args.github_backup:
+            followup = dispatch_pending(args.subject, publisher.repo, args.state_dir)
+            if followup:
+                result["pending_followup"] = followup
         print(json.dumps(result, ensure_ascii=False))
         return 0
     except (PublicationError, study_web_read.WebReadError, OSError) as exc:
-        result = {"status": "CLOUD_PENDING", "subject": getattr(args, "subject", None),
+        external = getattr(args, "github_backup", False) or getattr(args, "verify_remote", False)
+        result = {"status": "CLOUD_PENDING" if external else "LOCAL_SNAPSHOT_PENDING",
+                  "subject": getattr(args, "subject", None),
                   "event_id": getattr(args, "event_id", None), "local_formal_state": "PRESERVED",
                   "error": getattr(exc, "code", type(exc).__name__),
                   "detail": str(exc) if isinstance(exc, study_web_read.WebReadError) else getattr(exc, "detail", None),

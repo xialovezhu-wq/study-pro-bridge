@@ -321,6 +321,13 @@ class Published:
     def __init__(self, state: Path):
         self.state = state
 
+    def local_pending_receipts(self, subject: str):
+        """Only native local work can hold a local reader. Untagged receipts predate local publication."""
+        for path in (self.state / subject / "receipts").glob("*.json"):
+            row = load(path)
+            if row.get("publication_target") == "local" and row.get("status") != "PUBLISHED":
+                yield row
+
     def latest(self, subject: str) -> dict[str, Any]:
         latest = load(self.state / subject / "latest.json")
         require(latest.get("status") == "PUBLISHED" and latest.get("subject") == subject,
@@ -488,8 +495,10 @@ def scan_source_paths(subject: str, library: dict[str, Any]) -> list[str]:
     return sorted(paths)
 
 
-def scan_id_domains(subject: str, library: dict[str, Any], texts: dict[str, str]) -> dict[str, list[str]]:
-    domains = {"source_files": sorted(texts)}
+def scan_id_domains(subject: str, library: dict[str, Any], texts: dict[str, str],
+                    jsonl_records: dict[str, list[dict[str, Any]]] | None = None) -> dict[str, list[str]]:
+    jsonl_records = jsonl_records or {}
+    domains = {"source_files": sorted(set(texts) | set(jsonl_records))}
     entries, history = library.get("entrypoints", {}), library.get("history_index")
 
     def add(name: str, values: list[Any]):
@@ -498,7 +507,9 @@ def scan_id_domains(subject: str, library: dict[str, Any], texts: dict[str, str]
         domains[name] = sorted(set(values))
 
     def records(path: str):
-        return [json.loads(line) for line in texts[path].splitlines() if line.strip()]
+        if path in jsonl_records:
+            return jsonl_records[path]
+        return [json.loads(line) for line in texts[path].split("\n") if line.strip()]
 
     if subject == "math":
         cards = json.loads(texts[history]).get("cards")

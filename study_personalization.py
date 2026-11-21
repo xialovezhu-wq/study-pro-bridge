@@ -7,13 +7,15 @@ from __future__ import annotations
 import json
 from pathlib import Path
 import subprocess
+import sys
 from typing import Any
+from study_paths import subject_root
 
-ROOTS = {s: Path('/Users/YOUR_USER/Documents') / ('kaoyan-' + s)
+ROOTS = {s: subject_root(s)
          for s in ('math', 'english', '408')}
 MODULES = {'math': ('错题知识网络/scripts', 'study_personalization_math'),
            '408': ('scripts', 'study_personalization_408')}
-PYTHON = '/usr/local/bin/python3'
+PYTHON = sys.executable
 RUNNER = '''
 import importlib,json,sys
 from pathlib import Path
@@ -25,6 +27,11 @@ if request['subject']=='english':
     from english_pipeline.util import object_sha256
     hashes=formal_versions(repo)
     result={'status':'ready','formal_version':object_sha256(hashes),'formal_source_hashes':hashes}
+    try:
+        from english_pipeline.writing_publication import summary_identity
+        result['personal_summary']=summary_identity(repo/'intake')
+    except (OSError, ImportError, ValueError):
+        result['personal_summary']={'status':'unknown'}
 else:
     sys.path.insert(0,str(repo/sys.argv[2]))
     native=importlib.import_module(sys.argv[3])
@@ -32,12 +39,17 @@ else:
         result=native.current_identity(repo)
     elif request['operation']=='plan':
         planner=getattr(native,'plan_snapshot',None)
-        result=(planner(Path(request['manifest_path']),request['knowledge_points'],request['weak_knowledge_points'])
+        options=({'view':request.get('view','protected'),
+                  **{k:request[k] for k in ('exam_question_id','current_question_id','current_question_part','formal_id','source_id','personal_scope','materials','known_version') if k in request}}
+                 if request['subject']=='408' else {})
+        result=(planner(Path(request['manifest_path']),request['knowledge_points'],request['weak_knowledge_points'],**options)
                 if planner else {'layout':'legacy','files':[]})
     else:
         result=native.query_snapshot(Path(request['manifest_path']),
             request['knowledge_points'],request['weak_knowledge_points'],
-            request['view'],request['max_bytes'],request['cursor'])
+            request['view'],request['max_bytes'],request['cursor'],
+            **({k:request[k] for k in ('exam_question_id','current_question_id','current_question_part','formal_id','source_id','personal_scope','materials','known_version') if k in request}
+               if request['subject']=='408' else {}))
 json.dump(result,sys.stdout,ensure_ascii=False)
 '''
 
@@ -82,3 +94,16 @@ def compare_identity(published: dict, current: dict, *, personalized: bool) -> d
             'current_personalization_version': personal_new,
             'native_status': current.get('status'),
             'scope': 'committed formal and personal context; pending quick packages are not formal history'}
+
+
+def english_summary_freshness(published: dict, current: dict) -> dict:
+    old, new = published.get('version'), current.get('version')
+    if not old:
+        status = 'not_published'
+    elif current.get('status') != 'available' or not new:
+        status = 'pending' if current.get('status') == 'pending' else 'unknown'
+    else:
+        status = 'current' if old == new else 'stale'
+    return dict(personal_summary_freshness=status, published_personalization_version=old,
+                current_personalization_version=new, projection_sha256=published.get('projection_sha256'),
+                memory_generation=published.get('memory_generation'))
